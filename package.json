@@ -1,0 +1,176 @@
+{
+  "name": "overleaf-sync",
+  "displayName": "Overleaf Sync",
+  "description": "把 Overleaf 项目双向实时同步到本地文件夹：本地保存即推送到 Overleaf，网页端修改实时写回本地。",
+  "version": "0.1.3",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/measureer/overleaf-sync.git"
+  },
+  "icon": "resources/icons/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "overleaf-sync.addServer",
+        "title": "添加服务器",
+        "category": "Overleaf Sync",
+        "icon": "$(add)"
+      },
+      {
+        "command": "overleaf-sync.login",
+        "title": "登录",
+        "category": "Overleaf Sync"
+      },
+      {
+        "command": "overleaf-sync.logout",
+        "title": "登出",
+        "category": "Overleaf Sync"
+      },
+      {
+        "command": "overleaf-sync.removeServer",
+        "title": "移除服务器",
+        "category": "Overleaf Sync"
+      },
+      {
+        "command": "overleaf-sync.refresh",
+        "title": "刷新",
+        "category": "Overleaf Sync",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "overleaf-sync.openProject",
+        "title": "同步到本地文件夹…",
+        "category": "Overleaf Sync"
+      },
+      {
+        "command": "overleaf-sync.stopSync",
+        "title": "停止同步",
+        "category": "Overleaf Sync"
+      },
+      {
+        "command": "overleaf-sync.forcePull",
+        "title": "强制从远端拉取",
+        "category": "Overleaf Sync"
+      },
+      {
+        "command": "overleaf-sync.forcePush",
+        "title": "强制推送本地修改",
+        "category": "Overleaf Sync"
+      },
+      {
+        "command": "overleaf-sync.openLog",
+        "title": "打开日志",
+        "category": "Overleaf Sync"
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "id": "overleafSyncProjects",
+          "name": "Overleaf Sync",
+          "contextualTitle": "Overleaf Sync"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "overleaf-sync.addServer",
+          "when": "view == overleafSyncProjects",
+          "group": "navigation"
+        },
+        {
+          "command": "overleaf-sync.refresh",
+          "when": "view == overleafSyncProjects",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "overleaf-sync.login",
+          "when": "view == overleafSyncProjects && viewItem == server",
+          "group": "inline"
+        },
+        {
+          "command": "overleaf-sync.login",
+          "when": "view == overleafSyncProjects && viewItem == serverOnline"
+        },
+        {
+          "command": "overleaf-sync.logout",
+          "when": "view == overleafSyncProjects && viewItem == serverOnline"
+        },
+        {
+          "command": "overleaf-sync.removeServer",
+          "when": "view == overleafSyncProjects && viewItem =~ /server/"
+        },
+        {
+          "command": "overleaf-sync.openProject",
+          "when": "view == overleafSyncProjects && viewItem == project",
+          "group": "inline"
+        },
+        {
+          "command": "overleaf-sync.stopSync",
+          "when": "view == overleafSyncProjects && viewItem == projectSyncing",
+          "group": "inline"
+        },
+        {
+          "command": "overleaf-sync.forcePull",
+          "when": "view == overleafSyncProjects && viewItem == projectSyncing"
+        },
+        {
+          "command": "overleaf-sync.forcePush",
+          "when": "view == overleafSyncProjects && viewItem == projectSyncing"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Overleaf Sync",
+      "properties": {
+        "overleaf-sync.debounceMs": {
+          "type": "number",
+          "default": 300,
+          "description": "本地文件变更推送到远端的防抖时间（毫秒）"
+        },
+        "overleaf-sync.autoResume": {
+          "type": "boolean",
+          "default": true,
+          "description": "启动时自动恢复工作区内已绑定项目的同步会话"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "postinstall": "patch-package",
+    "compile": "esbuild src/extension.ts --bundle --platform=node --format=cjs --target=node18 --outfile=dist/extension.js --external:vscode --external:socket.io-client",
+    "watch": "npm run compile -- --watch",
+    "typecheck": "tsc --noEmit",
+    "vscode:prepublish": "npm run compile",
+    "package": "vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "fast-diff": "^1.3.0",
+    "form-data": "^4.0.0",
+    "mime-types": "^2.1.35",
+    "socket.io-client": "github:overleaf/socket.io-client#0.9.17-overleaf-5",
+    "undici": "^5.28.4"
+  },
+  "devDependencies": {
+    "@types/form-data": "^2.5.0",
+    "@types/mime-types": "^2.1.4",
+    "@types/node": "^18.19.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "esbuild": "^0.20.2",
+    "patch-package": "^8.0.0",
+    "typescript": "^5.4.5"
+  }
+}
