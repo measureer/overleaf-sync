@@ -374,6 +374,12 @@ export class ProjectSync {
         for (const [rel, rec] of entries) {
             if (!remoteIds.has(rec.id)) { continue; }
             if (await this.existsLocal(rel)) { continue; }
+            if (this.ignore.isIgnored(rel, rec.type === 'folder')) {
+                // 被忽略的路径不同步删除：远端文件保留，仅停止本地跟踪
+                log(`[${this.projectName}] 已忽略，跳过推送删除: ${rel}`);
+                this.state.removeRecursive(rel);
+                continue;
+            }
             const res = await this.api.deleteEntity(this.projectId, rec.type, rec.id);
             // 404/410：父文件夹删除时已连带删除，视为成功
             if (res.type !== 'success' && !/^(404|410)/.test(res.message ?? '')) {

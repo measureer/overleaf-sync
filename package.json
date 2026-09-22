@@ -2,7 +2,7 @@
   "name": "overleaf-sync",
   "displayName": "Overleaf Sync",
   "description": "把 Overleaf 项目双向同步到本地文件夹：支持手动（推送/拉取）与自动（实时双向）两种同步模式。",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "local",
   "license": "MIT",
   "repository": {
