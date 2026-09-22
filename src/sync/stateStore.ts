@@ -2,6 +2,9 @@ import * as vscode from 'vscode';
 
 export const STATE_FILE_NAME = '.overleaf-sync.json';
 
+/** 同步模式：manual=手动（推送/拉取按钮），auto=自动（双向实时） */
+export type SyncMode = 'manual' | 'auto';
+
 export interface EntityRecord {
     id: string;
     type: 'doc' | 'file' | 'folder';
@@ -12,6 +15,8 @@ export interface SyncStateData {
     serverUrl: string;
     projectId: string;
     projectName: string;
+    /** 缺省视为 manual */
+    syncMode?: SyncMode;
     /** key: 相对项目根目录的 posix 路径，如 "sections/intro.tex" */
     entities: Record<string, EntityRecord>;
     /** key: docId */
@@ -52,6 +57,7 @@ export class StateStore {
             serverUrl,
             projectId,
             projectName,
+            syncMode: 'manual',
             entities: {},
             docVersions: {},
             updatedAt: new Date().toISOString(),

@@ -1,8 +1,8 @@
 {
   "name": "overleaf-sync",
   "displayName": "Overleaf Sync",
-  "description": "把 Overleaf 项目双向实时同步到本地文件夹：本地保存即推送到 Overleaf，网页端修改实时写回本地。",
-  "version": "0.1.3",
+  "description": "把 Overleaf 项目双向同步到本地文件夹：支持手动（推送/拉取）与自动（实时双向）两种同步模式。",
+  "version": "0.1.4",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -57,14 +57,22 @@
         "category": "Overleaf Sync"
       },
       {
-        "command": "overleaf-sync.forcePull",
-        "title": "强制从远端拉取",
-        "category": "Overleaf Sync"
+        "command": "overleaf-sync.pull",
+        "title": "拉取（远端 → 本地）",
+        "category": "Overleaf Sync",
+        "icon": "$(cloud-download)"
       },
       {
-        "command": "overleaf-sync.forcePush",
-        "title": "强制推送本地修改",
-        "category": "Overleaf Sync"
+        "command": "overleaf-sync.push",
+        "title": "推送（本地 → 远端）",
+        "category": "Overleaf Sync",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "overleaf-sync.switchSyncMode",
+        "title": "切换同步模式",
+        "category": "Overleaf Sync",
+        "icon": "$(gear)"
       },
       {
         "command": "overleaf-sync.openLog",
@@ -119,16 +127,30 @@
         },
         {
           "command": "overleaf-sync.stopSync",
-          "when": "view == overleafSyncProjects && viewItem == projectSyncing",
-          "group": "inline"
+          "when": "view == overleafSyncProjects && viewItem =~ /projectSyncing/",
+          "group": "inline@3"
         },
         {
-          "command": "overleaf-sync.forcePull",
-          "when": "view == overleafSyncProjects && viewItem == projectSyncing"
+          "command": "overleaf-sync.push",
+          "when": "view == overleafSyncProjects && viewItem == projectSyncingManual",
+          "group": "inline@1"
         },
         {
-          "command": "overleaf-sync.forcePush",
-          "when": "view == overleafSyncProjects && viewItem == projectSyncing"
+          "command": "overleaf-sync.pull",
+          "when": "view == overleafSyncProjects && viewItem == projectSyncingManual",
+          "group": "inline@2"
+        },
+        {
+          "command": "overleaf-sync.push",
+          "when": "view == overleafSyncProjects && viewItem == projectSyncingAuto"
+        },
+        {
+          "command": "overleaf-sync.pull",
+          "when": "view == overleafSyncProjects && viewItem == projectSyncingAuto"
+        },
+        {
+          "command": "overleaf-sync.switchSyncMode",
+          "when": "view == overleafSyncProjects && viewItem =~ /projectSyncing/"
         }
       ]
     },
@@ -144,6 +166,15 @@
           "type": "boolean",
           "default": true,
           "description": "启动时自动恢复工作区内已绑定项目的同步会话"
+        },
+        "overleaf-sync.defaultSyncMode": {
+          "type": "string",
+          "enum": [
+            "manual",
+            "auto"
+          ],
+          "default": "manual",
+          "description": "新建同步会话的默认模式：manual=手动（通过推送/拉取按钮同步），auto=自动（双向实时同步）"
         }
       }
     }

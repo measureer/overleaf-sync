@@ -67,14 +67,19 @@ export function activate(context: vscode.ExtensionContext) {
             await syncManager!.stopSync(folder);
         }),
 
-        vscode.commands.registerCommand('overleaf-sync.forcePull', async (node?: ProjectNode) => {
+        vscode.commands.registerCommand('overleaf-sync.pull', async (node?: ProjectNode) => {
             const folder = node ? syncManager!.syncingFolderOf(node.project.id) : undefined;
-            await syncManager!.forcePull(folder);
+            await syncManager!.pull(folder);
         }),
 
-        vscode.commands.registerCommand('overleaf-sync.forcePush', async (node?: ProjectNode) => {
+        vscode.commands.registerCommand('overleaf-sync.push', async (node?: ProjectNode) => {
             const folder = node ? syncManager!.syncingFolderOf(node.project.id) : undefined;
-            await syncManager!.forcePush(folder);
+            await syncManager!.push(folder);
+        }),
+
+        vscode.commands.registerCommand('overleaf-sync.switchSyncMode', async (node?: ProjectNode) => {
+            const folder = node ? syncManager!.syncingFolderOf(node.project.id) : undefined;
+            await syncManager!.switchSyncMode(folder);
         }),
 
         vscode.commands.registerCommand('overleaf-sync.openLog', () => {

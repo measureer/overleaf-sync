@@ -4,8 +4,9 @@ import * as path from 'path';
 import { BaseAPI, FileEntity, FileType, FolderEntity, ProjectEntity } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { DocSession } from './docSession';
-import { StateStore, EntityRecord, STATE_FILE_NAME } from './stateStore';
+import { StateStore, EntityRecord, SyncMode, STATE_FILE_NAME } from './stateStore';
 import { StoredIdentity } from '../utils/secretStore';
+import { IgnoreMatcher, IGNORE_FILE_NAME } from '../utils/ignoreMatcher';
 import { log, logError } from '../utils/log';
 
 export type SyncStatus = 'connecting' | 'synced' | 'offline' | 'error';
@@ -39,6 +40,7 @@ export class ProjectSync {
     private stopped = false;
     private rootFolderId = '';
     private authErrorNotified = false;
+    private ignore: IgnoreMatcher = IgnoreMatcher.empty();
 
     constructor(
         readonly folderUri: vscode.Uri,
@@ -50,6 +52,8 @@ export class ProjectSync {
 
     get projectName() { return this.state.data.projectName; }
     get projectId() { return this.state.data.projectId; }
+    get syncMode(): SyncMode { return this.state.data.syncMode ?? 'manual'; }
+    get modeLabel(): string { return this.syncMode === 'auto' ? '自动' : '手动'; }
 
     get statusLabel(): string {
         switch (this.status) {
@@ -71,6 +75,7 @@ export class ProjectSync {
 
     async start(progress?: vscode.Progress<{ message?: string }>): Promise<void> {
         this.setStatus('connecting');
+        this.ignore = await IgnoreMatcher.load(this.folderUri);
         this.socket = new SocketIOAPI(this.state.data.serverUrl, this.identity, this.projectId, {
             onFileChanged: (update) => this.enqueue(() => this.applyRemoteUpdate(update)),
             onFileCreated: (parentFolderId, type, entity) => this.enqueue(() => this.applyRemoteCreate(parentFolderId, type, entity)),
@@ -92,14 +97,34 @@ export class ProjectSync {
 
         if (Object.keys(this.state.data.entities).length === 0) {
             await this.initialDownload(remoteEntities, progress);
-        } else {
+        } else if (this.syncMode === 'auto') {
             progress?.report({ message: '与远端状态对齐…' });
             await this.reconcile(remoteEntities, progress);
+        } else {
+            log(`[${this.projectName}] 手动模式：跳过启动时的自动对齐`);
         }
         await this.state.save();
-        this.startWatcher();
+        if (this.syncMode === 'auto') { this.startWatcher(); }
         this.setStatus('synced');
-        log(`[${this.projectName}] 同步已启动: ${this.folderUri.fsPath}`);
+        log(`[${this.projectName}] 同步已启动（${this.modeLabel}模式）: ${this.folderUri.fsPath}`);
+    }
+
+    /** 切换同步模式；切到自动时立即启动监听并对齐两端 */
+    async setSyncMode(mode: SyncMode): Promise<void> {
+        if (this.stopped || mode === this.syncMode) { return; }
+        this.state.data.syncMode = mode;
+        await this.state.save();
+        if (mode === 'auto') {
+            this.startWatcher();
+            this.enqueue(() => this.rejoin());
+        } else {
+            this.watcher?.dispose();
+            this.watcher = undefined;
+            for (const timer of this.debounceTimers.values()) { clearTimeout(timer); }
+            this.debounceTimers.clear();
+        }
+        log(`[${this.projectName}] 同步模式切换为: ${this.modeLabel}`);
+        this.onStatusChange?.();
     }
 
     async stop(): Promise<void> {
@@ -120,8 +145,10 @@ export class ProjectSync {
         try {
             const project = await this.socket!.rejoinProject();
             this.rootFolderId = this.rootFolderOf(project)?._id ?? this.rootFolderId;
-            await this.reconcile(this.flattenProject(project));
-            await this.state.save();
+            if (this.syncMode === 'auto') {
+                await this.reconcile(this.flattenProject(project));
+                await this.state.save();
+            }
             this.setStatus('synced');
             log(`[${this.projectName}] 重连成功`);
         } catch (err) {
@@ -130,10 +157,11 @@ export class ProjectSync {
         }
     }
 
-    async forcePull(): Promise<void> {
+    /** 拉取：远端优先，本地文件结构/文档内容全部以远端为准 */
+    async pull(): Promise<void> {
         this.enqueue(async () => {
             if (!this.socket) { return; }
-            log(`[${this.projectName}] 强制从远端拉取…`);
+            log(`[${this.projectName}] 从远端拉取…`);
             const project = await this.socket.rejoinProject();
             this.rootFolderId = this.rootFolderOf(project)?._id ?? this.rootFolderId;
             const remote = this.flattenProject(project);
@@ -176,32 +204,45 @@ export class ProjectSync {
             }
             await this.state.save();
             this.setStatus('synced');
-            log(`[${this.projectName}] 强制拉取完成`);
+            log(`[${this.projectName}] 拉取完成`);
             vscode.window.showInformationMessage(`Overleaf Sync: "${this.projectName}" 已从远端完整拉取`);
         });
     }
 
-    async forcePush(): Promise<void> {
+    /** 推送：本地优先，本地删除/新增同步到远端，文档内容以本地覆盖远端 */
+    async push(): Promise<void> {
         this.enqueue(async () => {
             if (!this.socket) { return; }
-            log(`[${this.projectName}] 强制推送本地修改…`);
+            log(`[${this.projectName}] 推送本地修改…`);
+            this.ignore = await IgnoreMatcher.load(this.folderUri);
+            const project = await this.socket.rejoinProject();
+            this.rootFolderId = this.rootFolderOf(project)?._id ?? this.rootFolderId;
+            const remote = this.flattenProject(project);
+
+            // 结构：本地已删除的推送删除到远端，本地新增的上传到远端
+            await this.pushOfflineDeletions(remote);
+            await this.uploadOfflineCreations();
+
+            // 文档内容：本地优先（远端也有修改时以本地覆盖）
             let pushed = 0;
             for (const [rel, rec] of Object.entries({ ...this.state.data.entities })) {
                 if (rec.type !== 'doc') { continue; }
                 try {
                     const content = await this.readLocalText(rel);
                     if (content === undefined) { continue; }
-                    let session = this.docs.get(rec.id);
-                    if (!session) {
-                        session = await DocSession.join(this.socket!, rec.id);
-                        this.docs.set(rec.id, session);
+                    // 始终重新加入文档，拿到远端最新版本，避免手动模式下缓存会话过期
+                    const session = await DocSession.join(this.socket!, rec.id);
+                    this.docs.set(rec.id, session);
+                    const storedV = this.state.data.docVersions[rec.id];
+                    if (storedV !== undefined && session.version !== storedV && content !== session.content) {
+                        log(`[${this.projectName}] 远端也有修改，以本地覆盖: ${rel}`);
                     }
                     if (await this.pushDocContent(rec.id, session, content)) { pushed++; }
                     this.state.data.docVersions[rec.id] = session.version;
                 } catch (err) { logError(`推送失败: ${rel}`, err); }
             }
             await this.state.save();
-            log(`[${this.projectName}] 强制推送完成，共 ${pushed} 个文档有更新`);
+            log(`[${this.projectName}] 推送完成，共 ${pushed} 个文档有更新`);
             vscode.window.showInformationMessage(`Overleaf Sync: "${this.projectName}" 推送完成（${pushed} 个文档有更新）`);
         });
     }
@@ -357,7 +398,8 @@ export class ProjectSync {
             } catch { return; }
             for (const [name, type] of entries) {
                 const rel = dirRel ? `${dirRel}/${name}` : name;
-                if (rel === STATE_FILE_NAME || rel === '.git' || rel.startsWith('.git/')) { continue; }
+                if (rel === STATE_FILE_NAME) { continue; }
+                if (this.ignore.isIgnored(rel, type === vscode.FileType.Directory)) { continue; }
                 if (!this.state.data.entities[rel]) { pending.push(rel); }
                 if (type === vscode.FileType.Directory) { await walk(rel); }
             }
@@ -381,6 +423,11 @@ export class ProjectSync {
         if (this.stopped || !this.socket) { return; }
         // 回声消除：本端推送的更新
         if (update.meta?.source && update.meta.source === this.socket.publicId) { return; }
+        if (this.syncMode === 'manual') {
+            // 手动模式下不应用远端改动，仅使缓存的文档会话失效（推送时会重新加入）
+            this.docs.delete(update.doc);
+            return;
+        }
         const rel = this.state.findPathById(update.doc);
         if (!rel) { return; }
 
@@ -410,7 +457,7 @@ export class ProjectSync {
     }
 
     private async applyRemoteCreate(parentFolderId: string, type: FileType, entity: FileEntity): Promise<void> {
-        if (this.stopped) { return; }
+        if (this.stopped || this.syncMode === 'manual') { return; }
         const parentRel = parentFolderId === this.rootFolderId ? '' : (this.state.findPathById(parentFolderId) ?? '');
         const rel = parentRel ? `${parentRel}/${entity.name}` : entity.name;
         if (this.state.data.entities[rel]) { return; }
@@ -426,7 +473,7 @@ export class ProjectSync {
     }
 
     private async applyRemoteRename(entityId: string, newName: string): Promise<void> {
-        if (this.stopped) { return; }
+        if (this.stopped || this.syncMode === 'manual') { return; }
         const rel = this.state.findPathById(entityId);
         if (!rel) { return; }
         const parentRel = rel.split('/').slice(0, -1).join('/');
@@ -439,7 +486,7 @@ export class ProjectSync {
     }
 
     private async applyRemoteRemove(entityId: string): Promise<void> {
-        if (this.stopped) { return; }
+        if (this.stopped || this.syncMode === 'manual') { return; }
         const rel = this.state.findPathById(entityId);
         if (!rel) { return; }
         const rec = this.state.data.entities[rel];
@@ -451,7 +498,7 @@ export class ProjectSync {
     }
 
     private async applyRemoteMove(entityId: string, folderId: string): Promise<void> {
-        if (this.stopped) { return; }
+        if (this.stopped || this.syncMode === 'manual') { return; }
         const rel = this.state.findPathById(entityId);
         if (!rel) { return; }
         const folderRel = folderId === this.rootFolderId ? '' : (this.state.findPathById(folderId) ?? '');
@@ -475,10 +522,18 @@ export class ProjectSync {
     }
 
     private onLocalEvent(uri: vscode.Uri, kind: 'create' | 'change' | 'delete') {
-        if (this.stopped) { return; }
+        if (this.stopped || this.syncMode === 'manual') { return; }
         const rel = this.relOf(uri);
         if (rel === undefined || rel === '' || rel === STATE_FILE_NAME) { return; }
-        if (rel === '.git' || rel.startsWith('.git/')) { return; }
+        if (rel === IGNORE_FILE_NAME) {
+            // 忽略规则变更：立即重载，无需重启同步
+            void IgnoreMatcher.load(this.folderUri).then(m => {
+                this.ignore = m;
+                log(`[${this.projectName}] ${IGNORE_FILE_NAME} 已更新，忽略规则已重载`);
+            });
+            return;
+        }
+        if (this.ignore.isIgnored(rel)) { return; }
         if (this.isSuppressed(rel)) { return; }
 
         const key = kind + ':' + rel;

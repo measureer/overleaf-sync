@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { BaseAPI, ProjectPersist } from '../api/base';
 import { ProjectSync } from './projectSync';
-import { StateStore } from './stateStore';
+import { StateStore, SyncMode } from './stateStore';
 import { ConfigStore, ServerConfig, StoredIdentity } from '../utils/secretStore';
 import { pickServer, loginFlow } from '../utils/authFlow';
 import { log, logError } from '../utils/log';
@@ -34,6 +34,13 @@ export class SyncManager {
     syncingFolderOf(projectId: string): string | undefined {
         for (const [folder, session] of this.sessions) {
             if (session.projectId === projectId) { return folder; }
+        }
+        return undefined;
+    }
+
+    syncModeOf(projectId: string): SyncMode | undefined {
+        for (const session of this.sessions.values()) {
+            if (session.projectId === projectId) { return session.syncMode; }
         }
         return undefined;
     }
@@ -118,6 +125,9 @@ export class SyncManager {
                 if (choice !== '继续') { return false; }
             }
             state = StateStore.create(folderUri, server.name, server.url, project.id, project.name);
+            state.data.syncMode = vscode.workspace
+                .getConfiguration('overleaf-sync')
+                .get<SyncMode>('defaultSyncMode', 'manual');
             await state.save();
         }
 
@@ -171,14 +181,33 @@ export class SyncManager {
         this.fireChange();
     }
 
-    async forcePull(folderFsPath?: string): Promise<void> {
+    async pull(folderFsPath?: string): Promise<void> {
         const session = await this.pickSession(folderFsPath);
-        await session?.sync.forcePull();
+        await session?.sync.pull();
     }
 
-    async forcePush(folderFsPath?: string): Promise<void> {
+    async push(folderFsPath?: string): Promise<void> {
         const session = await this.pickSession(folderFsPath);
-        await session?.sync.forcePush();
+        await session?.sync.push();
+    }
+
+    async switchSyncMode(folderFsPath?: string): Promise<void> {
+        const session = await this.pickSession(folderFsPath);
+        if (!session) { return; }
+        const current = session.sync.syncMode;
+        const picked = await vscode.window.showQuickPick(
+            [
+                { label: '手动模式', description: '通过「推送」「拉取」按钮手动同步', value: 'manual' as SyncMode },
+                { label: '自动模式', description: '本地与远端双向实时同步', value: 'auto' as SyncMode },
+            ].map(item => item.value === current ? { ...item, description: `$(check) 当前　${item.description}` } : item),
+            { placeHolder: `选择 "${session.sync.projectName}" 的同步模式`, ignoreFocusOut: true },
+        );
+        if (!picked || picked.value === current) { return; }
+        await session.sync.setSyncMode(picked.value);
+        this.fireChange();
+        vscode.window.showInformationMessage(
+            `Overleaf Sync: "${session.sync.projectName}" 已切换为${picked.value === 'auto' ? '自动' : '手动'}模式`,
+        );
     }
 
     private async pickSession(folderFsPath?: string): Promise<{ folder: string; sync: ProjectSync } | undefined> {
@@ -219,7 +248,7 @@ export class SyncManager {
         } else {
             this.statusBar.backgroundColor = undefined;
         }
-        this.statusBar.tooltip = sessions.map(s => `${s.projectName}: ${s.statusLabel}`).join('\n');
+        this.statusBar.tooltip = sessions.map(s => `${s.projectName}: ${s.statusLabel} · ${s.modeLabel}模式`).join('\n');
         this.statusBar.show();
     }
 
