@@ -24,12 +24,46 @@ export interface UpdateSchema {
     };
 }
 
+/** 协作者在线状态（clientTracking 协议），字段做防御性归一化 */
+export interface PresenceUser {
+    userId: string;
+    name?: string;
+    email?: string;
+    /** 光标所在文档 id（未必存在） */
+    docId?: string;
+    row?: number;
+    column?: number;
+    /** epoch ms；无服务端时间戳时取收到事件的本地时间 */
+    lastActive?: number;
+}
+
+export function normalizePresenceUser(raw: any): PresenceUser | undefined {
+    if (!raw || typeof raw !== 'object') { return undefined; }
+    const userId = raw.user_id ?? raw.id;
+    if (!userId) { return undefined; }
+    const cursor = raw.cursor && typeof raw.cursor === 'object' ? raw.cursor : undefined;
+    const docId = raw.doc_id ?? cursor?.doc_id;
+    const name = [raw.first_name, raw.last_name].filter(Boolean).join(' ') || raw.name || undefined;
+    const ts = raw.last_updated_at ?? raw.lastUpdatedAt;
+    return {
+        userId: String(userId),
+        name: name || undefined,
+        email: raw.email || undefined,
+        docId: docId ? String(docId) : undefined,
+        row: raw.row ?? cursor?.row,
+        column: raw.column ?? cursor?.column,
+        lastActive: typeof ts === 'number' ? (ts < 1e12 ? ts * 1000 : ts) : Date.now(),
+    };
+}
+
 export interface SocketEvents {
     onFileCreated?: (parentFolderId: string, type: FileType, entity: FileEntity) => void;
     onFileRenamed?: (entityId: string, newName: string) => void;
     onFileRemoved?: (entityId: string) => void;
     onFileMoved?: (entityId: string, newParentFolderId: string) => void;
     onFileChanged?: (update: UpdateSchema) => void;
+    onPresenceUserUpsert?: (user: PresenceUser) => void;
+    onPresenceUserDisconnected?: (userId: string) => void;
     onDisconnected?: () => void;
     onRejoinNeeded?: () => void;
 }
@@ -125,6 +159,19 @@ export class SocketIOAPI {
         if (this.events.onFileChanged) {
             s.on('otUpdateApplied', (update: UpdateSchema) => this.events.onFileChanged!(update));
         }
+
+        s.on('clientTracking.clientConnected', (raw: any) => {
+            const user = normalizePresenceUser(raw);
+            if (user) { this.events.onPresenceUserUpsert?.(user); }
+        });
+        s.on('clientTracking.clientUpdated', (raw: any) => {
+            const user = normalizePresenceUser(raw);
+            if (user) { this.events.onPresenceUserUpsert?.(user); }
+        });
+        s.on('clientTracking.clientDisconnected', (raw: any) => {
+            const userId = normalizePresenceUser(raw)?.userId ?? (typeof raw === 'string' ? raw : undefined);
+            if (userId) { this.events.onPresenceUserDisconnected?.(userId); }
+        });
 
         if (this.scheme === 'v2' && onV2Joined) {
             s.on('joinProjectResponse', (res: any) => {
@@ -236,5 +283,26 @@ export class SocketIOAPI {
      */
     async applyOtUpdate(docId: string, update: UpdateSchema) {
         return this.emit('applyOtUpdate', docId, update).then(() => { return; });
+    }
+
+    /**
+     * 拉取当前项目的在线协作者列表。presence 属于辅助能力，任何失败都返回空数组。
+     * 注意：服务端 ack 可能是 callback(users) 或 callback(err, users)，两种都兼容。
+     */
+    getConnectedUsers(): Promise<PresenceUser[]> {
+        return new Promise<PresenceUser[]>((resolve) => {
+            if (!this.socket || !this.joined) { resolve([]); return; }
+            const timer = setTimeout(() => resolve([]), 5000);
+            try {
+                this.socket.emit('clientTracking.getConnectedUsers', (a: any, b: any) => {
+                    clearTimeout(timer);
+                    const list = Array.isArray(a) ? a : (Array.isArray(b) ? b : []);
+                    resolve(list.map(normalizePresenceUser).filter((u): u is PresenceUser => !!u));
+                });
+            } catch {
+                clearTimeout(timer);
+                resolve([]);
+            }
+        });
     }
 }

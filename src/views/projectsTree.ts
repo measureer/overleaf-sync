@@ -79,8 +79,11 @@ export class ProjectsTreeProvider implements vscode.TreeDataProvider<TreeNode> {
         const item = new vscode.TreeItem(node.project.name, vscode.TreeItemCollapsibleState.None);
         if (syncingFolder) {
             const mode = this.syncManager.syncModeOf(node.project.id) ?? 'manual';
-            item.description = mode === 'auto' ? '同步中 · 自动' : '同步中 · 手动';
-            item.tooltip = `${syncingFolder}\n同步模式：${mode === 'auto' ? '自动' : '手动'}`;
+            const online = this.syncManager.presenceCountOf(node.project.id) ?? 0;
+            const presenceDesc = online > 0 ? ` · ${online} 人在线` : '';
+            item.description = (mode === 'auto' ? '同步中 · 自动' : '同步中 · 手动') + presenceDesc;
+            item.tooltip = `${syncingFolder}\n同步模式：${mode === 'auto' ? '自动' : '手动'}`
+                + (online > 0 ? `\n协作者在线：${online} 人` : '');
             item.iconPath = new vscode.ThemeIcon(mode === 'auto' ? 'sync' : 'sync-ignored');
             item.contextValue = mode === 'auto' ? 'projectSyncingAuto' : 'projectSyncingManual';
         } else {

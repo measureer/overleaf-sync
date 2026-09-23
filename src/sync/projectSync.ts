@@ -2,9 +2,9 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { BaseAPI, FileEntity, FileType, FolderEntity, ProjectEntity } from '../api/base';
-import { SocketIOAPI, UpdateSchema } from '../api/socketio';
+import { SocketIOAPI, UpdateSchema, PresenceUser } from '../api/socketio';
 import { DocSession } from './docSession';
-import { StateStore, EntityRecord, SyncMode, STATE_FILE_NAME } from './stateStore';
+import { StateStore, EntityRecord, SyncMode, STATE_FILE_NAME, PRESENCE_FILE_NAME } from './stateStore';
 import { StoredIdentity } from '../utils/secretStore';
 import { IgnoreMatcher, IGNORE_FILE_NAME } from '../utils/ignoreMatcher';
 import { log, logError } from '../utils/log';
@@ -24,6 +24,11 @@ const BINARY_EXTENSIONS = new Set([
     '.otf', '.woff', '.woff2', '.eot', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
 ]);
 
+/** 协作者光标活动时间窗口：超过该时间未更新视为"在线但不在编辑" */
+const PRESENCE_ACTIVE_WINDOW_MS = 15 * 60_000;
+/** 协作者状态文件的周期刷新间隔，供 agent 判断文件时效 */
+const PRESENCE_REFRESH_MS = 30_000;
+
 /** 单个 Overleaf 项目 ↔ 一个本地目录的双向同步会话 */
 export class ProjectSync {
     status: SyncStatus = 'connecting';
@@ -41,6 +46,9 @@ export class ProjectSync {
     private rootFolderId = '';
     private authErrorNotified = false;
     private ignore: IgnoreMatcher = IgnoreMatcher.empty();
+    private readonly collaborators = new Map<string, PresenceUser>(); // key: userId
+    private presenceSaveTimer?: NodeJS.Timeout;
+    private presenceRefreshTimer?: NodeJS.Timeout;
 
     constructor(
         readonly folderUri: vscode.Uri,
@@ -64,6 +72,9 @@ export class ProjectSync {
         }
     }
 
+    /** 在线协作者人数（不含本账号） */
+    get onlineCollaborators(): number { return this.collaborators.size; }
+
     private setStatus(status: SyncStatus) {
         if (this.status !== status) {
             this.status = status;
@@ -82,9 +93,19 @@ export class ProjectSync {
             onFileRenamed: (entityId, newName) => this.enqueue(() => this.applyRemoteRename(entityId, newName)),
             onFileRemoved: (entityId) => this.enqueue(() => this.applyRemoteRemove(entityId)),
             onFileMoved: (entityId, folderId) => this.enqueue(() => this.applyRemoteMove(entityId, folderId)),
+            onPresenceUserUpsert: (user) => this.upsertCollaborator(user),
+            onPresenceUserDisconnected: (userId) => {
+                if (this.collaborators.delete(userId)) {
+                    this.schedulePresenceWrite();
+                    this.onStatusChange?.();
+                }
+            },
             onDisconnected: () => {
                 if (this.stopped) { return; }
                 this.setStatus('offline');
+                // 断线后 presence 不可信：清空，待重连后重新拉取
+                this.collaborators.clear();
+                this.schedulePresenceWrite();
                 log(`[${this.projectName}] 连接断开，等待自动重连…`);
             },
             onRejoinNeeded: () => this.enqueue(() => this.rejoin()),
@@ -93,6 +114,8 @@ export class ProjectSync {
         progress?.report({ message: '连接 Overleaf 实时服务…' });
         const project = await this.socket.connect();
         this.rootFolderId = this.rootFolderOf(project)?._id ?? '';
+        await this.refreshPresence();
+        this.presenceRefreshTimer = setInterval(() => { void this.writePresenceFile(); }, PRESENCE_REFRESH_MS);
         const remoteEntities = this.flattenProject(project);
 
         if (Object.keys(this.state.data.entities).length === 0) {
@@ -132,8 +155,12 @@ export class ProjectSync {
         for (const timer of this.debounceTimers.values()) { clearTimeout(timer); }
         this.debounceTimers.clear();
         if (this.saveTimer) { clearTimeout(this.saveTimer); }
+        if (this.presenceSaveTimer) { clearTimeout(this.presenceSaveTimer); }
+        if (this.presenceRefreshTimer) { clearInterval(this.presenceRefreshTimer); }
         this.watcher?.dispose();
         this.socket?.disconnect();
+        this.collaborators.clear();
+        try { await this.writePresenceFile(true); } catch { /* ignore */ }
         try { await this.state.save(); } catch { /* ignore */ }
         log(`[${this.projectName}] 同步已停止`);
     }
@@ -145,6 +172,7 @@ export class ProjectSync {
         try {
             const project = await this.socket!.rejoinProject();
             this.rootFolderId = this.rootFolderOf(project)?._id ?? this.rootFolderId;
+            await this.refreshPresence();
             if (this.syncMode === 'auto') {
                 await this.reconcile(this.flattenProject(project));
                 await this.state.save();
@@ -155,6 +183,78 @@ export class ProjectSync {
             logError(`[${this.projectName}] 重连失败`, err);
             this.setStatus('offline');
         }
+    }
+
+    // ---------- 协作者在线状态（presence） ----------
+
+    /** 拉取当前在线协作者全量列表（加入项目/重连后调用） */
+    private async refreshPresence(): Promise<void> {
+        if (this.stopped || !this.socket) { return; }
+        const users = await this.socket.getConnectedUsers();
+        this.collaborators.clear();
+        for (const user of users) { this.upsertCollaborator(user); }
+        await this.writePresenceFile();
+    }
+
+    private upsertCollaborator(user: PresenceUser) {
+        // 本账号的连接（含插件自身与同一账号开的网页）不计入协作者
+        if (!user.userId || user.userId === this.identity.userId) { return; }
+        const prev = this.collaborators.get(user.userId);
+        this.collaborators.set(user.userId, { ...prev, ...user, lastActive: user.lastActive ?? Date.now() });
+        this.schedulePresenceWrite();
+        this.onStatusChange?.();
+    }
+
+    /** 最近活动时间窗口内的协作者（附正在编辑的本地路径） */
+    private activeCollaborators(): Array<PresenceUser & { docPath?: string }> {
+        const now = Date.now();
+        const out: Array<PresenceUser & { docPath?: string }> = [];
+        for (const c of this.collaborators.values()) {
+            if (c.lastActive === undefined || now - c.lastActive >= PRESENCE_ACTIVE_WINDOW_MS) { continue; }
+            out.push({ ...c, docPath: c.docId ? this.state.findPathById(c.docId) : undefined });
+        }
+        return out;
+    }
+
+    private schedulePresenceWrite() {
+        if (this.presenceSaveTimer) { clearTimeout(this.presenceSaveTimer); }
+        this.presenceSaveTimer = setTimeout(() => { void this.writePresenceFile(); }, 500);
+    }
+
+    /**
+     * 把协作者状态写入同步目录下的 .overleaf-sync-presence.json。
+     * 供人查看，也供 AI agent 轮询：busyFiles 非空或有活跃协作者时应等待而不是修改文件。
+     */
+    private async writePresenceFile(force = false): Promise<void> {
+        if (this.stopped && !force) { return; }
+        const now = Date.now();
+        const collaborators = [...this.collaborators.values()].map(c => {
+            const editingFile = c.docId ? this.state.findPathById(c.docId) ?? null : null;
+            return {
+                name: c.name ?? null,
+                email: c.email ?? null,
+                editingFile,
+                lastActive: c.lastActive ? new Date(c.lastActive).toISOString() : null,
+                active: c.lastActive !== undefined && now - c.lastActive < PRESENCE_ACTIVE_WINDOW_MS,
+            };
+        });
+        const busyFiles = collaborators.filter(c => c.active && c.editingFile).map(c => c.editingFile);
+        const payload = {
+            syncActive: !this.stopped && this.status !== 'offline',
+            connectionStatus: this.status,
+            projectId: this.projectId,
+            projectName: this.projectName,
+            syncMode: this.syncMode,
+            updatedAt: new Date(now).toISOString(),
+            collaboratorsOnline: collaborators.length,
+            collaborators,
+            busyFiles,
+            note: 'For agents: read this file before modifying project files. If syncActive is false or updatedAt is older than 2 minutes, the sync status is unknown — do not rely on this file. If collaboratorsOnline is greater than 0, wait and re-read this file before editing any project file; only edit when no collaborators are online.',
+        };
+        await vscode.workspace.fs.writeFile(
+            vscode.Uri.joinPath(this.folderUri, PRESENCE_FILE_NAME),
+            Buffer.from(JSON.stringify(payload, null, 2), 'utf-8'),
+        );
     }
 
     /** 拉取：远端优先，本地文件结构/文档内容全部以远端为准 */
@@ -211,6 +311,20 @@ export class ProjectSync {
 
     /** 推送：本地优先，本地删除/新增同步到远端，文档内容以本地覆盖远端 */
     async push(): Promise<void> {
+        const active = this.activeCollaborators();
+        if (active.length > 0) {
+            const desc = active.map(c =>
+                `${c.name || c.email || c.userId}${c.docPath ? `（正在编辑 ${c.docPath}）` : ''}`,
+            ).join('、');
+            const choice = await vscode.window.showWarningMessage(
+                `Overleaf Sync: 检测到协作者活动：${desc}。推送会以本地版本覆盖远端，可能与其正在进行的修改冲突。`,
+                { modal: true }, '仍要推送',
+            );
+            if (choice !== '仍要推送') {
+                log(`[${this.projectName}] 推送已取消：有协作者活动（${desc}）`);
+                return;
+            }
+        }
         this.enqueue(async () => {
             if (!this.socket) { return; }
             log(`[${this.projectName}] 推送本地修改…`);
@@ -404,7 +518,7 @@ export class ProjectSync {
             } catch { return; }
             for (const [name, type] of entries) {
                 const rel = dirRel ? `${dirRel}/${name}` : name;
-                if (rel === STATE_FILE_NAME) { continue; }
+                if (rel === STATE_FILE_NAME || rel === PRESENCE_FILE_NAME) { continue; }
                 if (this.ignore.isIgnored(rel, type === vscode.FileType.Directory)) { continue; }
                 if (!this.state.data.entities[rel]) { pending.push(rel); }
                 if (type === vscode.FileType.Directory) { await walk(rel); }
@@ -530,7 +644,7 @@ export class ProjectSync {
     private onLocalEvent(uri: vscode.Uri, kind: 'create' | 'change' | 'delete') {
         if (this.stopped || this.syncMode === 'manual') { return; }
         const rel = this.relOf(uri);
-        if (rel === undefined || rel === '' || rel === STATE_FILE_NAME) { return; }
+        if (rel === undefined || rel === '' || rel === STATE_FILE_NAME || rel === PRESENCE_FILE_NAME) { return; }
         if (rel === IGNORE_FILE_NAME) {
             // 忽略规则变更：立即重载，无需重启同步
             void IgnoreMatcher.load(this.folderUri).then(m => {

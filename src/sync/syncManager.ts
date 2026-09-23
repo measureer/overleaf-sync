@@ -45,6 +45,13 @@ export class SyncManager {
         return undefined;
     }
 
+    presenceCountOf(projectId: string): number | undefined {
+        for (const session of this.sessions.values()) {
+            if (session.projectId === projectId) { return session.onlineCollaborators; }
+        }
+        return undefined;
+    }
+
     async openProject(node?: { server: ServerConfig; project: ProjectPersist }): Promise<void> {
         let server = node?.server;
         if (!server) {
@@ -248,7 +255,10 @@ export class SyncManager {
         } else {
             this.statusBar.backgroundColor = undefined;
         }
-        this.statusBar.tooltip = sessions.map(s => `${s.projectName}: ${s.statusLabel} · ${s.modeLabel}模式`).join('\n');
+        this.statusBar.tooltip = sessions.map(s =>
+            `${s.projectName}: ${s.statusLabel} · ${s.modeLabel}模式`
+            + (s.onlineCollaborators > 0 ? ` · ${s.onlineCollaborators} 位协作者在线` : ''),
+        ).join('\n');
         this.statusBar.show();
     }
 

@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 
 export const STATE_FILE_NAME = '.overleaf-sync.json';
+/** 协作者在线状态文件：供人查看，也供 AI agent 读取以决定是否能安全修改文件 */
+export const PRESENCE_FILE_NAME = '.overleaf-sync-presence.json';
 
 /** 同步模式：manual=手动（推送/拉取按钮），auto=自动（双向实时） */
 export type SyncMode = 'manual' | 'auto';
